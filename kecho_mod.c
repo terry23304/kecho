@@ -39,8 +39,6 @@ struct task_struct *echo_server;
 static int open_listen(struct socket **);
 static void close_listen(struct socket *);
 
-struct workqueue_struct *kecho_wq;
-
 static int kecho_init_module(void)
 {
     int error = open_listen(&listen_sock);
@@ -51,24 +49,6 @@ static int kecho_init_module(void)
 
     param.listen_sock = listen_sock;
 
-    /*
-     * Create a dedicated workqueue instead of using system_wq
-     * since the task could be a CPU-intensive work item
-     * if its lifetime of connection is too long, e.g., using
-     * `telnet` to communicate with kecho. Flag WQ_UNBOUND
-     * fits this scenario. Note that the trade-off of this
-     * flag is cache locality.
-     *
-     * You can specify module parameter "bench=1" if you won't
-     * use telnet-like program to interact with the module.
-     * This earns you better cache locality than using default
-     * flag, `WQ_UNBOUND`. Note that your machine may going
-     * unstable if you use telnet-like program along with
-     * module parameter "bench=1" to interact with the module.
-     * Since without `WQ_UNBOUND` flag specified, a
-     * long-running task may delay other tasks in the kernel.
-     */
-    kecho_wq = alloc_workqueue(MODULE_NAME, bench ? 0 : WQ_UNBOUND, 0);
     echo_server = kthread_run(echo_server_daemon, &param, MODULE_NAME);
     if (IS_ERR(echo_server)) {
         printk(KERN_ERR MODULE_NAME ": cannot start server daemon\n");
@@ -83,7 +63,6 @@ static void kecho_cleanup_module(void)
     send_sig(SIGTERM, echo_server, 1);
     kthread_stop(echo_server);
     close_listen(listen_sock);
-    destroy_workqueue(kecho_wq);
     printk(MODULE_NAME ": module successfully removed \n");
 }
 

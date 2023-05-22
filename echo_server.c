@@ -8,9 +8,6 @@
 
 #define BUF_SIZE 4096
 
-struct echo_service daemon = {.is_stopped = false};
-extern struct workqueue_struct *kecho_wq;
-
 static int get_request(struct socket *sock, unsigned char *buf, size_t size)
 {
     struct msghdr msg;
@@ -64,19 +61,19 @@ static int send_request(struct socket *sock, unsigned char *buf, size_t size)
     return length;
 }
 
-static void echo_server_worker(struct work_struct *work)
+static int echo_server_worker(void *arg)
 {
-    struct kecho *worker = container_of(work, struct kecho, kecho_work);
+    struct socket *sock = arg;
     unsigned char *buf;
 
     buf = kzalloc(BUF_SIZE, GFP_KERNEL);
     if (!buf) {
         printk(KERN_ERR MODULE_NAME ": kmalloc error....\n");
-        return;
+        return -1;
     }
 
-    while (!daemon.is_stopped) {
-        int res = get_request(worker->sock, buf, BUF_SIZE - 1);
+    while (!kthread_should_stop()) {
+        int res = get_request(sock, buf, BUF_SIZE - 1);
         if (res <= 0) {
             if (res) {
                 printk(KERN_ERR MODULE_NAME ": get request error = %d\n", res);
@@ -84,7 +81,7 @@ static void echo_server_worker(struct work_struct *work)
             break;
         }
 
-        res = send_request(worker->sock, buf, res);
+        res = send_request(sock, buf, res);
         if (res < 0) {
             printk(KERN_ERR MODULE_NAME ": send request error = %d\n", res);
             break;
@@ -93,50 +90,20 @@ static void echo_server_worker(struct work_struct *work)
         memset(buf, 0, res);
     }
 
-    kernel_sock_shutdown(worker->sock, SHUT_RDWR);
+    kernel_sock_shutdown(sock, SHUT_RDWR);
+    sock_release(sock);
     kfree(buf);
-}
-
-static struct work_struct *create_work(struct socket *sk)
-{
-    struct kecho *work;
-
-    if (!(work = kmalloc(sizeof(struct kecho), GFP_KERNEL)))
-        return NULL;
-
-    work->sock = sk;
-
-    INIT_WORK(&work->kecho_work, echo_server_worker);
-
-    list_add(&work->list, &daemon.worker);
-
-    return &work->kecho_work;
-}
-
-/* it would be better if we do this dynamically */
-static void free_work(void)
-{
-    struct kecho *l, *tar;
-    /* cppcheck-suppress uninitvar */
-
-    list_for_each_entry_safe (tar, l, &daemon.worker, list) {
-        kernel_sock_shutdown(tar->sock, SHUT_RDWR);
-        flush_work(&tar->kecho_work);
-        sock_release(tar->sock);
-        kfree(tar);
-    }
+    return 0;
 }
 
 int echo_server_daemon(void *arg)
 {
     struct echo_server_param *param = arg;
     struct socket *sock;
-    struct work_struct *work;
+    struct task_struct *worker;
 
     allow_signal(SIGKILL);
     allow_signal(SIGTERM);
-
-    INIT_LIST_HEAD(&daemon.worker);
 
     while (!kthread_should_stop()) {
         /* using blocking I/O */
@@ -148,22 +115,14 @@ int echo_server_daemon(void *arg)
             continue;
         }
 
-        if (unlikely(!(work = create_work(sock)))) {
-            printk(KERN_ERR MODULE_NAME
-                   ": create work error, connection closed\n");
-            kernel_sock_shutdown(sock, SHUT_RDWR);
-            sock_release(sock);
+        worker = kthread_run(echo_server_worker, sock, KBUILD_MODNAME);
+        if (IS_ERR(worker)) {
+            pr_err("create work error\n");
             continue;
         }
-
-        /* start server worker */
-        queue_work(kecho_wq, work);
     }
 
     printk(MODULE_NAME ": daemon shutdown in progress...\n");
-
-    daemon.is_stopped = true;
-    free_work();
 
     return 0;
 }
